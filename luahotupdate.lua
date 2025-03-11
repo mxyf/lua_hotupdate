@@ -7,6 +7,10 @@ function HU.DebugNofity(...)
 	if HU.DebugNofityFunc then HU.DebugNofityFunc(...) end
 end
 
+local function rawpairs(t)
+    return next, t, nil
+end
+
 local function GetWorkingDir()
 	if HU.WorkingDir == nil then
 	    local p = io.popen("echo %cd%")
@@ -37,26 +41,42 @@ local function Normalize(path)
     return table.concat(parts, "\\")
 end
 
-function HU.InitFileMap(RootPath)
-	for _, rootpath in pairs(RootPath) do
-		rootpath = Normalize(rootpath)
-		local file = io.popen("dir /S/B /A:A \""..rootpath.."\"")
-		io.input(file)
-		for line in io.lines() do
-	   		local FileName = string.match(line,".*\\(.*)%.lua")
-	  	    if FileName ~= nil then
-	            if HU.FileMap[FileName] == nil then
-	            	HU.FileMap[FileName] = {}
-	        	end
-	        	local luapath = string.sub(line, #rootpath+2, #line-4)
-				luapath = string.gsub(luapath, "\\", ".")
-				HU.LuaPathToSysPath[luapath] = SysPath
-	        	table.insert(HU.FileMap[FileName], {SysPath = line, LuaPath = luapath})
-	    	end
-	    end
-	    file:close()
+local prefixes = {"you", "lua", "file", "dir"}
+local function remove_prefix(luapath)
+	for _, prefix in ipairs(prefixes) do
+		if luapath:sub(1, #prefix + 1) == prefix .. "." then
+			return luapath:sub(#prefix + 2)
+		end
 	end
+	return luapath
 end
+
+function HU.TryAddToFileMap(SysPath)
+	local fileName = string.match(SysPath, "[^/]*$")
+	SysPath = SysPath .. '.lua'
+	if HU.FileMap[fileName] == nil then
+		HU.FileMap[fileName] = {}
+	end
+	local rootpath = Normalize(HU.rootPath)
+
+	local luapath = string.sub(SysPath, #rootpath+2, #SysPath-4)
+	luapath = string.gsub(luapath, "/", ".")
+	luapath = remove_prefix(luapath)
+	table.insert(HU.FileMap[fileName], {SysPath = SysPath, LuaPath = luapath})
+end
+
+HU.BlackList = {
+    ["Class"] = true,
+    -- 无法热重载的模块路径
+}
+
+HU.SpecialData = {
+	["common.event_const"] = true,
+}
+
+HU.MeGlobal = {
+    --自己项目的全局变量
+}
 
 function HU.InitFakeTable()
 	local meta = {}
@@ -71,13 +91,6 @@ function HU.InitFakeTable()
 	local function getmetatable(t, metaT)
 		return setmetatable({}, t)
 	end
-	local function require(LuaPath)
-		if not HU.RequireMap[LuaPath] then
-			local FakeTable = FakeT()
-			HU.RequireMap[LuaPath] = FakeTable
-		end
-		return HU.RequireMap[LuaPath]
-	end
 	function meta.__index(t, k)
 		if k == "setmetatable" then
 			return setmetatable
@@ -87,6 +100,8 @@ function HU.InitFakeTable()
 			return EmptyFunc
 		elseif k == "require" then
 			return require
+		elseif HU.MeGlobal[k] then
+			return HU.MeGlobal[k]
 		else
 			local FakeTable = FakeT()
 			rawset(t, k, FakeTable)
@@ -130,21 +145,16 @@ function HU.AddFileFromHUList()
 	HU.ALL = false
 	HU.HUMap = {}
 	for _, file in pairs(FileList) do
-		if file == "_ALL_" then
-			HU.ALL = true
-			for k, v in pairs(HU.FileMap) do
-				for _, path in pairs(v) do
-					HU.HUMap[path.LuaPath] = path.SysPath  	
-				end
-			end
-			return
-		end
-		if HU.FileMap[file] then
-			for _, path in pairs(HU.FileMap[file]) do
+		local fileName = string.match(file, "[^/]*$") 
+		if HU.FileMap[fileName] then
+			for _, path in pairs(HU.FileMap[fileName]) do
 				HU.HUMap[path.LuaPath] = path.SysPath  	
 			end
 		else
-			HU.FailNotify("HotUpdate can't not find "..file)
+			HU.TryAddToFileMap(file)
+			for _, path in pairs(HU.FileMap[fileName]) do
+				HU.HUMap[path.LuaPath] = path.SysPath  	
+			end
 		end
 	end
 end
@@ -155,6 +165,10 @@ function HU.ErrorHandle(e)
 end
 
 function HU.BuildNewCode(SysPath, LuaPath)
+	if HU.BlackList[LuaPath] then
+		HU.NotifyFunc(LuaPath..'脚本不允许更新，维持原状！')
+		return false
+	end
 	io.input(SysPath)
 	local NewCode = io.read("*all")
 	if HU.ALL and HU.OldCode[SysPath] == nil then
@@ -170,7 +184,7 @@ function HU.BuildNewCode(SysPath, LuaPath)
 	local chunk = "--[["..LuaPath.."]] "
 	chunk = chunk..NewCode	
 	io.input():close()
-	local NewFunction = loadstring(chunk)
+	local NewFunction = loadstring(chunk, LuaPath:gsub("%.", "/"))
 	if not NewFunction then 
   		HU.FailNotify(SysPath.." has syntax error.")  	
   		collectgarbage("collect")
@@ -185,6 +199,7 @@ function HU.BuildNewCode(SysPath, LuaPath)
 		xpcall(function () NewObject = NewFunction() end, HU.ErrorHandle)
 		if not HU.ErrorHappen then 
 			HU.OldCode[SysPath] = NewCode
+			HU.NotifyFunc(LuaPath..'脚本更新！')
 			return true, NewObject
 		else
 	  		collectgarbage("collect")
@@ -192,6 +207,7 @@ function HU.BuildNewCode(SysPath, LuaPath)
 		end
 	end
 end
+
 
 function HU.Travel_G()
 	local visited = {}
@@ -204,8 +220,9 @@ function HU.Travel_G()
 				local name, value = debug.getupvalue(t, i)
 				if not name then break end
 				if type(value) == "function" then
-					for _, funcs in ipairs(HU.ChangedFuncList) do
-						if value == funcs[1] then
+					if HU.ChangedFuncListFastMap[value] then
+						for _, index in ipairs(HU.ChangedFuncListFastMap[value]) do
+							local funcs = HU.ChangedFuncList[index]
 							debug.setupvalue(t, i, funcs[2])
 						end
 					end
@@ -215,16 +232,20 @@ function HU.Travel_G()
 		elseif type(t) == "table" then
 			f(debug.getmetatable(t))
 			local changeIndexs = nil
-			for k,v in pairs(t) do
-				f(k); f(v);
+			for k,v in rawpairs(t) do
+				f(k); 
+				f(v);
 				if type(v) == "function" then
-					for _, funcs in ipairs(HU.ChangedFuncList) do
-						if v == funcs[1] then t[k] = funcs[2] end
+					if HU.ChangedFuncListFastMap[v] then
+						for _, index in ipairs(HU.ChangedFuncListFastMap[v]) do
+							local funcs = HU.ChangedFuncList[index]
+							t[k] = funcs[2] 
+						end
 					end
 				end
 				if type(k) == "function" then
-					for index, funcs in ipairs(HU.ChangedFuncList) do
-						if k == funcs[1] then 
+					if HU.ChangedFuncListFastMap[k] then
+						for _, index in ipairs(HU.ChangedFuncListFastMap[k]) do
 							changeIndexs = changeIndexs or {}
 							changeIndexs[#changeIndexs+1] = index 
 						end
@@ -244,7 +265,7 @@ function HU.Travel_G()
 	f(_G)
 	local registryTable = debug.getregistry()
 	f(registryTable)
-	
+	f(HU.MeGlobal)
 	for _, funcs in ipairs(HU.ChangedFuncList) do
 		if funcs[3] == "HUDebug" then funcs[4]:HUDebug() end
 	end
@@ -260,15 +281,57 @@ function HU.ReplaceOld(OldObject, NewObject, LuaPath, From, Deepth)
 	end
 end
 
+function HU.HotUpdateData(LuaPath, replace_old)
+	local OldTable = package.loaded[LuaPath]
+	if not OldTable then
+		HU.NotifyFunc(LuaPath..'这个data没加载过，不做处理！')
+		return
+	end
+	package.loaded[LuaPath] = nil
+	local NewTable = require(LuaPath)
+
+	if replace_old then
+		for k, _ in pairs(OldTable) do
+			OldTable[k] = nil
+		end
+		for k, v in pairs(NewTable) do 
+			OldTable[k] = v
+		end
+		package.loaded[LuaPath] = OldTable
+	end
+	log.error("update data ",LuaPath)
+end
+
+function HU.check_is_data(str)
+	if string.find(str, "^data%.") ~= nil or string.find(str, "^lua_shared%.") ~= nil then
+		return true, false
+	end
+	if HU.SpecialData[str] then
+		return true, true
+	end
+	return false, false
+end
+
 function HU.HotUpdateCode(LuaPath, SysPath)
+	local is_data, is_need_replace_old = HU.check_is_data(LuaPath)
+	if is_data then
+		HU.HotUpdateData(LuaPath, is_need_replace_old)
+		return
+	end
 	local OldObject = package.loaded[LuaPath]
+	local component_reload_flag = false
 	if OldObject ~= nil then
 		HU.VisitedSig = {}
 		HU.ChangedFuncList = {}
+		HU.ChangedFuncListFastMap = {}
+		--[[
+			这里可能需要对class做一些处理，比如说有一些类的设定不容许重复初始化
+		]]
+
 		local Success, NewObject = HU.BuildNewCode(SysPath, LuaPath)
 		if Success then
 			HU.ReplaceOld(OldObject, NewObject, LuaPath, "Main", "")
-			for LuaPath, NewObject in pairs(HU.RequireMap) do
+			for LuaPath, NewObject in rawpairs(HU.RequireMap) do
 				local OldObject = package.loaded[LuaPath]
 				HU.ReplaceOld(OldObject, NewObject, LuaPath, "Main_require", "")
 			end
@@ -279,10 +342,11 @@ function HU.HotUpdateCode(LuaPath, SysPath)
 			end
 			collectgarbage("collect")
 		end
-	elseif HU.OldCode[SysPath] == nil then 
-		io.input(SysPath)
-		HU.OldCode[SysPath] = io.read("*all")
-		io.input():close()
+	else
+		HU.NotifyFunc(LuaPath..'脚本没加载过，不做处理！')
+	end
+	if component_reload_flag then
+		--
 	end
 end
 
@@ -296,7 +360,7 @@ function HU.ResetENV(object, name, From, Deepth)
 			xpcall(function () setfenv(object, HU.ENV) end, HU.FailNotify)
 		elseif type(object) == "table" then
 			HU.DebugNofity(Deepth.."HU.ResetENV", name, "  from:"..From)
-			for k, v in pairs(object) do
+			for k, v in rawpairs(object) do
 				f(k, tostring(k).."__key", " HU.ResetENV ", Deepth.."    " )
 				f(v, tostring(k), " HU.ResetENV ", Deepth.."    ")
 			end
@@ -336,6 +400,7 @@ function HU.UpdateUpvalue(OldFunction, NewFunction, Name, From, Deepth)
 	end
 end 
 
+
 function HU.UpdateOneFunction(OldObject, NewObject, FuncName, OldTable, From, Deepth)
 	if HU.Protection[OldObject] or HU.Protection[NewObject] then return end
 	if OldObject == NewObject then return end
@@ -346,6 +411,10 @@ function HU.UpdateOneFunction(OldObject, NewObject, FuncName, OldTable, From, De
 	if pcall(debug.setfenv, NewObject, getfenv(OldObject)) then
 		HU.UpdateUpvalue(OldObject, NewObject, FuncName, "HU.UpdateOneFunction", Deepth.."    ")
 		HU.ChangedFuncList[#HU.ChangedFuncList + 1] = {OldObject, NewObject, FuncName, OldTable}
+		if not HU.ChangedFuncListFastMap[OldObject] then
+			HU.ChangedFuncListFastMap[OldObject] = {}
+		end
+		table.insert(HU.ChangedFuncListFastMap[OldObject], #HU.ChangedFuncList)
 	end
 end
 
@@ -356,7 +425,7 @@ function HU.UpdateAllFunction(OldTable, NewTable, Name, From, Deepth)
 	if HU.VisitedSig[signature] then return end
 	HU.VisitedSig[signature] = true
 	HU.DebugNofity(Deepth.."HU.UpdateAllFunction "..Name.."  from:"..From)
-	for ElementName, Element in pairs(NewTable) do
+	for ElementName, Element in rawpairs(NewTable) do
 		local OldElement = OldTable[ElementName]
 		if type(Element) == type(OldElement) then
 			if type(Element) == "function" then
@@ -372,33 +441,40 @@ function HU.UpdateAllFunction(OldTable, NewTable, Name, From, Deepth)
 	end
 	local OldMeta = debug.getmetatable(OldTable)  
 	local NewMeta = HU.MetaMap[NewTable]
+	if --[[一些require之后返回的内容有元表的]] true then
+		NewMeta = debug.getmetatable(NewTable) 
+	end
 	if type(OldMeta) == "table" and type(NewMeta) == "table" then
 		HU.UpdateAllFunction(OldMeta, NewMeta, Name.."'s Meta", "HU.UpdateAllFunction", Deepth.."    ")
 	end
 end
 
-function HU.Init(UpdateListFile, RootPath, FailNotify, ENV)
+function HU.Init(UpdateListFile, rootPath, FailNotify, ENV)
 	HU.UpdateListFile = UpdateListFile
 	HU.HUMap = {}
 	HU.FileMap = {}
 	HU.NotifyFunc = FailNotify
 	HU.OldCode = {}
 	HU.ChangedFuncList = {}
+	HU.ChangedFuncListFastMap = {}
 	HU.VisitedSig = {}
 	HU.FakeENV = nil
 	HU.ENV = ENV or _G
 	HU.LuaPathToSysPath = {}
-	HU.InitFileMap(RootPath)
+	HU.rootPath = rootPath
 	HU.FakeT = HU.InitFakeTable()
 	HU.InitProtection()
 	HU.ALL = false
 end
 
 function HU.Update()
+	--local start_time = os.clock()
 	HU.AddFileFromHUList()
 	for LuaPath, SysPath in pairs(HU.HUMap) do
 		HU.HotUpdateCode(LuaPath, SysPath)
 	end
+	--local end_time = os.clock()
+	--log.error("update耗时", end_time - start_time)
 end
 
 return HU
